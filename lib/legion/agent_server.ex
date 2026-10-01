@@ -105,6 +105,7 @@ defmodule Legion.AgentServer do
   def init({agent_module, config, store, agent_id, persistence_frequency, track_usage}) do
     parent_agent_id = Vault.get(:agent_id)
     mode = Map.get(config, :start_mode, :normal)
+    watch_resume_owner(mode)
 
     Vault.unsafe_put(:agent_id, agent_id)
     Vault.unsafe_put(:parent_agent_id, parent_agent_id)
@@ -124,44 +125,139 @@ defmodule Legion.AgentServer do
       %{agent: agent_module}
     )
 
-    {saved_messages, saved_bindings, saved_executor_state, saved_usage} =
-      case store && store.get(agent_id) do
-        {:ok,
-         %Payload{
-           conversation_state: %{
-             messages: messages,
-             bindings: bindings,
-             executor_state: executor_state
-           },
-           usage: usage
-         }} ->
-          {messages, bindings, executor_state, if(track_usage, do: usage || [], else: nil)}
+    saved = store && store.get(agent_id)
 
-        _no_state ->
-          {[], [], :nonexistent, if(track_usage, do: [], else: nil)}
-      end
+    with :ok <- validate_resume_checkpoint(mode, saved, agent_module, agent_id) do
+      {saved_messages, saved_bindings, saved_executor_state, saved_usage} =
+        case saved do
+          {:ok,
+           %Payload{
+             conversation_state: %{
+               messages: messages,
+               bindings: bindings,
+               executor_state: executor_state
+             },
+             usage: usage
+           }} ->
+            {messages, bindings, executor_state, if(track_usage, do: usage || [], else: nil)}
 
-    state = %__MODULE__{
-      agent_module: agent_module,
-      messages: [Executor.message(:system, system_prompt) | saved_messages],
-      config: config,
-      store: store,
-      agent_id: agent_id,
-      persistence_frequency: persistence_frequency,
-      bindings: saved_bindings,
-      executor_state: saved_executor_state,
-      track_usage: track_usage,
-      usage: saved_usage
-    }
+          _no_state ->
+            {[], [], :nonexistent, if(track_usage, do: [], else: nil)}
+        end
 
-    {:ok,
-     persist(state,
-       agent_module: state.agent_module,
-       parent_agent_id: parent_agent_id,
-       started_at: NaiveDateTime.utc_now(),
-       usage: state.usage
-     ), {:continue, %{start_mode: mode, executor_state: saved_executor_state}}}
+      state = %__MODULE__{
+        agent_module: agent_module,
+        messages: [Executor.message(:system, system_prompt) | saved_messages],
+        config: config,
+        store: store,
+        agent_id: agent_id,
+        persistence_frequency: persistence_frequency,
+        bindings: saved_bindings,
+        executor_state: saved_executor_state,
+        track_usage: track_usage,
+        usage: saved_usage
+      }
+
+      fields = [
+        agent_module: state.agent_module,
+        parent_agent_id: parent_agent_id,
+        started_at: NaiveDateTime.utc_now(),
+        usage: state.usage
+      ]
+
+      fields =
+        if mode != :normal and saved_executor_state != :nonexistent do
+          checkpoint = %{
+            messages: state.messages,
+            bindings: saved_bindings,
+            executor_state: saved_executor_state
+          }
+
+          [{:conversation_state, checkpoint}, {:status, :running} | fields]
+        else
+          fields
+        end
+
+      {:ok, persist(state, fields),
+       {:continue, %{start_mode: mode, executor_state: saved_executor_state}}}
+    else
+      {:error, reason} -> {:stop, reason}
+    end
   end
+
+  defp watch_resume_owner({:resume_sync, owner}) when is_pid(owner) do
+    server = self()
+
+    spawn_link(fn ->
+      owner_ref = Process.monitor(owner)
+      server_ref = Process.monitor(server)
+
+      receive do
+        {:DOWN, ^owner_ref, :process, ^owner, _reason} -> Process.exit(server, :kill)
+        {:DOWN, ^server_ref, :process, ^server, _reason} -> :ok
+      end
+    end)
+  end
+
+  defp watch_resume_owner(_mode), do: :ok
+
+  defp validate_resume_checkpoint(
+         {:resume_sync, _owner},
+         {:ok, %Payload{} = payload},
+         agent_module,
+         agent_id
+       ) do
+    if payload.agent_id == agent_id and payload.agent_module in [nil, agent_module] and
+         payload.parent_agent_id == nil and payload.status in [nil, :running] and
+         (is_nil(payload.usage) or is_list(payload.usage)) and
+         valid_resume_conversation?(payload.conversation_state) do
+      :ok
+    else
+      {:error, :invalid_resume_checkpoint}
+    end
+  end
+
+  defp validate_resume_checkpoint({:resume_sync, _owner}, _saved, _agent_module, _agent_id),
+    do: {:error, :invalid_resume_checkpoint}
+
+  defp validate_resume_checkpoint(_mode, _saved, _agent_module, _agent_id), do: :ok
+
+  defp valid_resume_conversation?(%{
+         messages: messages,
+         bindings: bindings,
+         executor_state: executor_state
+       })
+       when is_list(messages) and is_list(bindings) do
+    match?(%{role: "user"}, List.last(messages)) and
+      Enum.all?(messages, fn
+        %{role: role, content: content} when role in ["user", "assistant"] ->
+          is_binary(content) or is_list(content)
+
+        _ ->
+          false
+      end) and
+      Enum.all?(bindings, fn
+        {name, _value} when is_atom(name) or is_binary(name) -> true
+        _ -> false
+      end) and valid_resume_executor_state?(executor_state)
+  end
+
+  defp valid_resume_conversation?(_conversation), do: false
+
+  defp valid_resume_executor_state?(%{phase: :awaiting_llm, iteration: i, retries: r} = state)
+       when map_size(state) == 3 and is_integer(i) and i >= 0 and is_integer(r) and r >= 0,
+       do: true
+
+  defp valid_resume_executor_state?(
+         %{phase: :completing, iteration: i, retries: r, result: _result} = state
+       )
+       when map_size(state) == 4 and is_integer(i) and i >= 0 and is_integer(r) and r >= 0,
+       do: true
+
+  defp valid_resume_executor_state?(_state), do: false
+
+  @impl true
+  def handle_continue(%{start_mode: {:resume_sync, _owner}}, state), do: {:noreply, state}
 
   @impl true
   def handle_continue(%{start_mode: :normal}, state), do: {:noreply, state}
@@ -202,10 +298,36 @@ defmodule Legion.AgentServer do
   end
 
   @impl true
+  def handle_call(
+        :resume_saved_turn,
+        {owner, _tag},
+        %{config: %{start_mode: {:resume_sync, owner}}} = state
+      ) do
+    {reply, state} = do_run(state, state.executor_state)
+    {:stop, :normal, reply, state}
+  end
+
+  @impl true
+  def handle_call(:resume_saved_turn, _from, state),
+    do: {:reply, {:error, :invalid_resume_owner}, state}
+
+  @impl true
+  def handle_call(
+        {:message, _message},
+        _from,
+        %{config: %{start_mode: {:resume_sync, _owner}}} = state
+      ),
+      do: {:reply, {:error, :resume_only}, state}
+
+  @impl true
   def handle_call({:message, message}, _from, state) do
     {reply, state} = handle_message(message, state)
     {:reply, reply, state}
   end
+
+  @impl true
+  def handle_cast({:message, _message}, %{config: %{start_mode: {:resume_sync, _owner}}} = state),
+    do: {:noreply, state}
 
   @impl true
   def handle_cast({:message, message}, state) do

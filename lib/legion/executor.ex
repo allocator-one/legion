@@ -128,7 +128,9 @@ defmodule Legion.Executor do
   `messages` must already include the system prompt and the current user message.
   `bindings` seeds the code-evaluation binding. `executor_state` resumes a step
   checkpoint when present: `:awaiting_llm` continues from its saved iteration
-  and retry counters, while `:completing` finishes without another LLM request.
+  and retry counters, while `:completing` returns its saved raw result without
+  another LLM request. A legacy completing checkpoint without a result cancels
+  with `:missing_checkpoint_result` instead of inventing a successful value.
   Pass `:nonexistent` (the default) to start a new loop. `:turn_usage` is the complete, ordered list
   of usage maps returned by LLM requests in the current turn.
 
@@ -145,8 +147,11 @@ defmodule Legion.Executor do
       %{phase: :awaiting_llm, iteration: i, retries: r} ->
         loop(agent_module, messages, config, i, r, bindings, [])
 
+      %{phase: :completing, iteration: _i, retries: _r, result: result} ->
+        {:ok, result, messages, bindings, []}
+
       %{phase: :completing, iteration: _i, retries: _r} ->
-        {:ok, nil, messages, bindings, []}
+        {:cancel, :missing_checkpoint_result, messages, bindings, []}
     end
   end
 
@@ -345,7 +350,7 @@ defmodule Legion.Executor do
           if eval == "eval_and_continue" do
             %{phase: :awaiting_llm, iteration: i + 1, retries: 0}
           else
-            %{phase: :completing, iteration: i, retries: 0}
+            %{phase: :completing, iteration: i, retries: 0, result: result}
           end
 
         checkpoint!(config, messages, new_bindings, executor_state)

@@ -85,6 +85,75 @@ defmodule Legion do
   end
 
   @doc """
+  Finishes one saved step checkpoint and returns its native result.
+
+  Requires an explicit `:store` and nonempty `:agent_id`. The trusted caller
+  supplies the agent module; the stored module, when present, must match it.
+  Other options configure the resumed agent as in `start_link/2`.
+
+  No task is appended. Saved iteration/retry counters and bindings continue
+  in the same turn. Returns `{:ok, result}` or `{:cancel, reason}` only after
+  final persistence succeeds and the temporary process stops normally.
+  Returns `{:error, reason}` for invalid options/checkpoints, an existing live
+  identity, or an interrupted/failed recovery. Caller death stops the agent.
+
+  Only concrete step checkpoints are accepted. An explicit idle status is
+  refused. A nil status/module is accepted for partial step payloads, but
+  never for an ordinary snapshot. Completing checkpoints must include their
+  raw `:result`; older completing checkpoints without it cannot be resumed.
+  """
+  @spec resume_sync(module(), keyword()) :: {:ok, term()} | {:cancel, term()} | {:error, term()}
+  def resume_sync(agent_module, opts) when is_atom(agent_module) and is_list(opts) do
+    if valid_resume_options?(agent_module, opts) do
+      opts = Keyword.put(opts, :start_mode, {:resume_sync, self()})
+
+      case AgentServer.start_monitor(agent_module, opts) do
+        {:ok, {pid, ref}} -> await_resume_result(pid, ref)
+        {:error, {:already_started, _pid}} -> {:error, :already_running}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      {:error, :invalid_resume_options}
+    end
+  rescue
+    error -> {:error, error}
+  catch
+    :exit, reason -> {:error, reason}
+  end
+
+  def resume_sync(_agent_module, _opts), do: {:error, :invalid_resume_options}
+
+  defp valid_resume_options?(agent_module, opts) do
+    with true <- agent_module not in [nil, true, false] and Keyword.keyword?(opts),
+         {:ok, store} when is_atom(store) and store not in [nil, true, false] <-
+           Keyword.fetch(opts, :store),
+         {:ok, id} when is_binary(id) and id != "" <- Keyword.fetch(opts, :agent_id) do
+      String.valid?(id)
+    else
+      _ -> false
+    end
+  end
+
+  defp await_resume_result(pid, ref) do
+    try do
+      result = GenServer.call(pid, :resume_saved_turn, :infinity)
+
+      receive do
+        {:DOWN, ^ref, :process, ^pid, :normal} -> result
+        {:DOWN, ^ref, :process, ^pid, reason} -> {:error, reason}
+      end
+    catch
+      :exit, _call_failure ->
+        receive do
+          {:DOWN, ^ref, :process, ^pid, reason} -> {:error, reason}
+        end
+    after
+      if Process.alive?(pid), do: Process.exit(pid, :kill)
+      Process.demonitor(ref, [:flush])
+    end
+  end
+
+  @doc """
   Starts a long-lived agent process.
 
   ## Options

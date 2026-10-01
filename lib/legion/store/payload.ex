@@ -8,6 +8,14 @@ defmodule Legion.Store.Payload do
   checkpoint. Its `:executor_state` value is `:nonexistent` for an ordinary snapshot
   or a map when step persistence captures an interrupted turn.
 
+  An `:awaiting_llm` checkpoint contains `:phase`, `:iteration`, and `:retries`.
+  A `:completing` checkpoint also requires `:result`, containing the raw code
+  evaluation result so recovery can return it without executing the code again.
+  An explicitly stored `nil` result is valid and differs from a missing key;
+  the partial-update convention for top-level fields does not apply to this
+  nested result. Legacy completing checkpoints without `:result` are invalid
+  for synchronous recovery with `Legion.resume_sync/2`.
+
   See `Legion.Store` for the full store contract.
   """
 
@@ -25,11 +33,18 @@ defmodule Legion.Store.Payload do
 
   @type status :: :idle | :running
 
-  @type executor_state :: %{
-          phase: :awaiting_llm | :completing,
-          iteration: non_neg_integer(),
-          retries: non_neg_integer()
-        }
+  @type executor_state ::
+          %{
+            phase: :awaiting_llm,
+            iteration: non_neg_integer(),
+            retries: non_neg_integer()
+          }
+          | %{
+              phase: :completing,
+              iteration: non_neg_integer(),
+              retries: non_neg_integer(),
+              result: term()
+            }
 
   @type state :: %{
           messages: [map()],
